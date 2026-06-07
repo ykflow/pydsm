@@ -1,0 +1,98 @@
+import numpy as np
+from numba import jit
+from numba.typed import List
+from measurement_equations.numerical_jacobian import JacTwoSided
+from measurement_equations.carr_wu_standard import carr_wu_iv, map_moments, Jkappa, Jomega, Jnu, Jrho
+from measurement_equations.carr_wu_seasonal_fixed import seasonal_effect
+
+
+@jit(nopython=True, cache=True)
+def carr_wu_prop_seasonal_dyn_fxd(f, FIXED, betas, p, m):
+    x, tau, T, Z = FIXED
+    kappa1, omega1_star, nu_star, rho_star, eta_tilde = f.flatten()
+    omega1, nu, rho, gamma = map_moments(omega1_star, nu_star, rho_star)
+    exp_eta_tau = np.exp(eta_tilde * tau)
+    S = seasonal_effect(betas, T)
+    kappa = (kappa1 + S) * exp_eta_tau
+    omega = omega1 * exp_eta_tau
+    return carr_wu_iv(kappa, omega, nu, rho, gamma, x, tau)
+
+
+@jit(nopython=True, cache=True)
+def jac_carr_wu_prop_seasonal_fxd(Zf, f, FIXED, betas, p, k):
+    x, tau, T, Z = FIXED
+    kappa1, omega1_star, nu_star, rho_star = f.flatten()
+    omega1, nu, rho, gamma = map_moments(omega1_star, nu_star, rho_star)
+    eta_tilde = betas.flatten()[0]
+    eta = np.exp(eta_tilde)
+    exp_eta_tau = np.exp(-eta * tau)
+    S = seasonal_effect(betas[1:], T)
+    kappa = (kappa1 + S) * exp_eta_tau
+    omega = omega1 * exp_eta_tau
+
+    tmp = 1 - 2 * kappa * tau - gamma * tau
+    a = -2 * tmp / (omega ** 2 * tau ** 2)
+    b = - rho * nu / omega
+    c = ((1 - rho ** 2) * (nu ** 2) / (omega ** 2)) + tmp ** 2 / (omega ** 4 * tau ** 2)
+    denom = tau * ((x - b) ** 2 + c)**.5
+
+    z_kappa = Jkappa(omega, b, c, tmp, x, tau)
+    z_omega = Jomega(omega, nu, rho, a, b, tmp, denom, x, tau)
+    z_nu = Jnu(omega, nu, rho, b, tmp, denom, x, tau)
+    z_rho = Jrho(omega, nu, tmp, denom, x, tau)
+
+    z1 = z_kappa * exp_eta_tau
+    z2 = z_omega * exp_eta_tau * omega1_star * omega
+    z3 = z_nu * nu_star * nu
+    z4 = z_rho * (4 * np.exp(2 * rho_star) / (np.exp(2 * rho_star) + 1) ** 2)
+
+    return np.concatenate((z1, z2, z3, z4), axis=1)
+
+
+class CarrWuPropSeasonalDynamicFixed:
+    def __init__(self, mean: str = 'carr_wu_prop_s1_dyn_fixed'):
+        self.mean = mean
+        self.Zf = carr_wu_prop_seasonal_dyn_fxd
+        # self.J = jac_carr_wu_prop_seasonal_fxd
+        self.J = None
+        self._dict_means = dict({'carr_wu_prop_s1_dyn_fixed': 2, 'carr_wu_prop_s2_dyn_fixed': 4,
+                                 'carr_wu_prop_s3_dyn_fixed': 6, 'carr_wu_prop_s4_dyn_fixed': 8})
+        self.k_fxd = 4 + 1
+        self.k_free = 0
+        self.k_betas_free = self._dict_means[self.mean]
+        self.k_betas_pos = 0
+        self._test_jac()
+
+    def _test_params(self):
+        p = 5
+        f = np.array([-3, -.5, -.5, .2]).reshape(self.k_fxd, 1)
+        x = np.array([-0.4, -0.3, 0, .5, 1]).reshape(p, 1)
+        tau = np.array([1 / 12, 1 / 2, 1 / 12, 1, 1 / 12]).reshape(p, 1)
+        Z = np.ones((p, self.k_fxd))
+        betas = np.array([-10, 2, 3, 4, 5, 6]).reshape(6,1)/10
+
+        T = tau + 0.125
+        FIXED = List()
+        FIXED.append(x)
+        FIXED.append(tau)
+        FIXED.append(T)
+        FIXED.append(Z)
+
+        args = (f, FIXED, betas, p, self.k_fxd)
+        return args
+
+    def _test_jac(self):
+        if self.J is not None:
+            args = self._test_params()
+            Jtrue = self.J(self.Zf, *args)
+            Japprox = JacTwoSided(self.Zf, *args)
+            error = ((Jtrue - Japprox)**2).mean(axis=0)**.5
+            print(error.round(5))
+            print('Analytical Jacobian Test Passed:', np.allclose(Jtrue, Japprox, atol=3e-2))
+            print(Jtrue)
+
+# cwsf = CarrWuProportionalSeasonalFixed()
+# cwsf._test_jac()
+
+
+
